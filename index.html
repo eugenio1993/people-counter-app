@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#101418">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon-192.png">
+<title>Conta persone</title>
+<style>
+  :root{--bg:#101418;--panel:rgba(16,20,24,.78);--ink:#f2f5f7;--muted:#9aa7b2;--line:#ffb400;--in:#4fd18b;--out:#ff7a6b}
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;overflow:hidden;overscroll-behavior:none}
+  #stage{position:fixed;inset:0}
+  video,canvas{position:absolute;inset:0;width:100%;height:100%}
+  video{object-fit:cover}
+  canvas{touch-action:none}
+  #top{position:fixed;left:0;right:0;top:0;padding:calc(env(safe-area-inset-top,0px) + 10px) 12px 12px;
+    background:linear-gradient(var(--panel),transparent);pointer-events:none}
+  #total{font-size:1.05rem;color:var(--muted)}
+  #total b{display:block;font-size:4.2rem;line-height:1;color:var(--ink);font-variant-numeric:tabular-nums;font-weight:700}
+  #dirs{margin-top:6px;font-size:1rem;display:flex;gap:16px;font-variant-numeric:tabular-nums}
+  #dirs .in{color:var(--in)} #dirs .out{color:var(--out)}
+  #status{position:fixed;left:12px;right:12px;top:50%;transform:translateY(-50%);text-align:center;font-size:1.1rem;
+    background:var(--panel);padding:14px;border-radius:12px;pointer-events:none}
+  #status:empty{display:none}
+  #bar{position:fixed;left:0;right:0;bottom:0;display:flex;gap:8px;padding:12px 12px calc(env(safe-area-inset-bottom,0px) + 12px);
+    background:linear-gradient(transparent,var(--panel))}
+  button{flex:1;min-height:52px;border:0;border-radius:12px;background:#27313a;color:var(--ink);font:600 .95rem system-ui,sans-serif;padding:8px}
+  button:active{background:#37444f}
+  button:focus-visible{outline:3px solid var(--line);outline-offset:2px}
+  #reset{background:#7a2b25}
+</style>
+</head>
+<body>
+<div id="stage">
+  <video id="video" playsinline muted autoplay></video>
+  <canvas id="overlay"></canvas>
+</div>
+<div id="top">
+  <div id="total">Persone contate<b id="count">0</b></div>
+  <div id="dirs"><span class="in">Entrate: <span id="cin">0</span></span><span class="out">Uscite: <span id="cout">0</span></span></div>
+</div>
+<div id="status">Avvio…</div>
+<div id="bar">
+  <button id="reset">Azzera</button>
+  <button id="rotate">Linea orizz./vert.</button>
+  <button id="flip">Inverti verso</button>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const video = $('video'), canvas = $('overlay'), ctx = canvas.getContext('2d');
+  const statusEl = $('status');
+
+  // ---- Stato (salvato sul dispositivo) ----
+  const defaults = {cin:0, cout:0, orient:'h', pos:0.5, flipped:false};
+  let S = {...defaults};
+  try { S = {...defaults, ...JSON.parse(localStorage.getItem('contapersone') || '{}')}; } catch(e){}
+  const save = () => { try { localStorage.setItem('contapersone', JSON.stringify(S)); } catch(e){} };
+
+  function renderCounts(){
+    $('count').textContent = S.cin + S.cout;
+    $('cin').textContent = S.cin; $('cout').textContent = S.cout;
+  }
+  renderCounts();
+
+  // ---- Dimensioni canvas ----
+  let W = 0, H = 0, dpr = 1;
+  function resize(){
+    dpr = window.devicePixelRatio || 1;
+    W = canvas.clientWidth; H = canvas.clientHeight;
+    canvas.width = W * dpr; canvas.height = H * dpr;
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+  }
+  addEventListener('resize', resize); resize();
+
+  // Il video è object-fit: cover: converto coordinate video -> schermo
+  function videoToScreen(x, y){
+    const vw = video.videoWidth, vh = video.videoHeight;
+    const s = Math.max(W / vw, H / vh);
+    return [x * s + (W - vw * s) / 2, y * s + (H - vh * s) / 2];
+  }
+
+  // ---- Tracker a centroidi ----
+  let tracks = [], nextId = 1;
+  const MAX_MISSED = 8, COOLDOWN = 700;
+
+  function lineValue(p){ return S.orient === 'h' ? p.y - S.pos * H : p.x - S.pos * W; }
+
+  function update(points, now){
+    const maxDist = Math.min(W, H) * 0.25;
+    const used = new Set();
+    tracks.forEach(t => t.matched = false);
+
+    // associazione greedy per distanza minima
+    const pairs = [];
+    tracks.forEach((t, i) => points.forEach((p, j) => {
+      const d = Math.hypot(t.x - p.x, t.y - p.y);
+      if (d < maxDist) pairs.push([d, i, j]);
+    }));
+    pairs.sort((a, b) => a[0] - b[0]);
+    const usedT = new Set();
+    for (const [, i, j] of pairs){
+      if (usedT.has(i) || used.has(j)) continue;
+      usedT.add(i); used.add(j);
+      const t = tracks[i], p = points[j];
+      const prevSide = Math.sign(lineValue(t)), side = Math.sign(lineValue(p));
+      if (prevSide !== 0 && side !== 0 && prevSide !== side && now - t.lastCount > COOLDOWN){
+        // dall'alto/sinistra (valore negativo) verso basso/destra (positivo) = "entrata", salvo inversione
+        const forward = prevSide < 0 && side > 0;
+        const isIn = S.flipped ? !forward : forward;
+        isIn ? S.cin++ : S.cout++;
+        t.lastCount = now; t.flash = now;
+        renderCounts(); save();
+        if (navigator.vibrate) navigator.vibrate(40);
+      }
+      t.x = p.x; t.y = p.y; t.box = p.box; t.missed = 0; t.matched = true;
+    }
+    tracks.forEach(t => { if (!t.matched) t.missed++; });
+    tracks = tracks.filter(t => t.missed <= MAX_MISSED);
+    points.forEach((p, j) => {
+      if (!used.has(j)) tracks.push({id: nextId++, x: p.x, y: p.y, box: p.box, missed: 0, lastCount: 0, flash: 0});
+    });
+  }
+
+  // ---- Disegno ----
+  function draw(now){
+    ctx.clearRect(0, 0, W, H);
+    // linea di conteggio
+    ctx.lineWidth = 4; ctx.strokeStyle = '#ffb400'; ctx.setLineDash([16, 10]);
+    ctx.beginPath();
+    if (S.orient === 'h'){ ctx.moveTo(0, S.pos * H); ctx.lineTo(W, S.pos * H); }
+    else { ctx.moveTo(S.pos * W, 0); ctx.lineTo(S.pos * W, H); }
+    ctx.stroke(); ctx.setLineDash([]);
+    // freccia "entrata"
+    const dirSign = S.flipped ? -1 : 1;
+    const cx = S.orient === 'h' ? W / 2 : S.pos * W, cy = S.orient === 'h' ? S.pos * H : H / 2;
+    const ax = S.orient === 'h' ? 0 : dirSign, ay = S.orient === 'h' ? dirSign : 0;
+    ctx.fillStyle = '#4fd18b'; ctx.beginPath();
+    ctx.moveTo(cx + ax * 30, cy + ay * 30);
+    ctx.lineTo(cx - ay * 16 + ax * 6, cy + ax * 16 + ay * 6);
+    ctx.lineTo(cx + ay * 16 + ax * 6, cy - ax * 16 + ay * 6);
+    ctx.fill();
+    // persone tracciate
+    ctx.font = '600 13px system-ui'; ctx.lineWidth = 2;
+    for (const t of tracks){
+      if (t.missed > 0) continue;
+      const hit = now - t.flash < 500;
+      ctx.strokeStyle = hit ? '#4fd18b' : 'rgba(255,255,255,.85)';
+      if (t.box) ctx.strokeRect(...t.box);
+      ctx.fillStyle = hit ? '#4fd18b' : '#fff';
+      ctx.beginPath(); ctx.arc(t.x, t.y, 6, 0, 7); ctx.fill();
+      ctx.fillText('#' + t.id, t.x + 10, t.y - 8);
+    }
+  }
+
+  // ---- Trascinare la linea ----
+  let dragging = false;
+  canvas.addEventListener('pointerdown', e => { dragging = true; canvas.setPointerCapture(e.pointerId); move(e); });
+  canvas.addEventListener('pointermove', e => { if (dragging) move(e); });
+  canvas.addEventListener('pointerup', () => { dragging = false; save(); });
+  function move(e){
+    const v = S.orient === 'h' ? e.clientY / H : e.clientX / W;
+    S.pos = Math.min(0.95, Math.max(0.05, v));
+  }
+
+  // ---- Pulsanti ----
+  $('reset').onclick = () => { if (confirm('Azzerare il contatore?')){ S.cin = S.cout = 0; tracks = []; renderCounts(); save(); } };
+  $('rotate').onclick = () => { S.orient = S.orient === 'h' ? 'v' : 'h'; S.pos = 0.5; tracks.forEach(t => t.lastCount = performance.now()); save(); };
+  $('flip').onclick = () => { S.flipped = !S.flipped; save(); };
+
+  // ---- Fotocamera + modello ----
+  async function start(){
+    try {
+      statusEl.textContent = 'Richiesta accesso alla fotocamera…';
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {facingMode: {ideal: 'environment'}, width: {ideal: 1280}, height: {ideal: 720}}, audio: false});
+      video.srcObject = stream;
+      await video.play();
+      statusEl.textContent = 'Caricamento modello (solo la prima volta serve internet)…';
+      const model = await cocoSsd.load({base: 'lite_mobilenet_v2'});
+      statusEl.textContent = '';
+      try { await navigator.wakeLock?.request('screen'); } catch(e){}
+      loop(model);
+    } catch(err){
+      statusEl.textContent = err.name === 'NotAllowedError'
+        ? 'Permesso negato. Consenti la fotocamera nelle impostazioni del sito e ricarica.'
+        : 'Errore: ' + err.message + ' (serve HTTPS o localhost)';
+    }
+  }
+
+  let busy = false;
+  async function loop(model){
+    const now = performance.now();
+    if (!busy && video.readyState >= 2){
+      busy = true;
+      try {
+        const preds = await model.detect(video, 20, 0.5);
+        const pts = preds.filter(p => p.class === 'person').map(p => {
+          const [x, y, w, h] = p.bbox;
+          const [sx, sy] = videoToScreen(x, y), [ex, ey] = videoToScreen(x + w, y + h);
+          return {x: (sx + ex) / 2, y: (sy + ey) / 2, box: [sx, sy, ex - sx, ey - sy]};
+        });
+        update(pts, now);
+      } catch(e){ console.error(e); }
+      busy = false;
+    }
+    draw(now);
+    requestAnimationFrame(() => loop(model));
+  }
+
+  document.addEventListener('visibilitychange', async () => {
+    if (!document.hidden) try { await navigator.wakeLock?.request('screen'); } catch(e){}
+  });
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(()=>{});
+  start();
+})();
+</script>
+</body>
+</html>
